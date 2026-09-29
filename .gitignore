@@ -1,0 +1,47 @@
+# TraceFlow .gitignore
+#
+# POLICY (from agent.md): the published repository contains ONLY README.md and
+# the actual source. Everything below is intentionally excluded so that the rule
+# is enforced mechanically rather than by discipline.
+#
+# If you ever decide to publish the planning documents, delete the corresponding
+# line here. Until then, this file is the single source of truth for the rule.
+
+# --- Internal planning / governance documents: never published ---
+plan.md
+agent.md
+mind.md
+review.md
+SKILL.state.md
+CONTEXT.md
+AGENTS.md
+CLAUDE.md
+
+# --- Internal design artifacts ---
+# The multi-agent review-protocol diagram referenced by review.md. It documents
+# how code is reviewed, not what the product does.
+Screenshot 2026-07-25 141652-1.png
+
+# --- Third-party skills collection (own git remote, kept local) ---
+skills/
+
+# --- Agent working state (owned by the agent, not the product) ---
+.agent/
+
+# --- WorkBuddy workspace memory ---
+.workbuddy-ai/
+
+# --- TraceFlow's own runtime artifacts ---
+.traceflow/
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traceflow"
+version = "0.1.0"
+description = "Local-first, agent-independent change intelligence for AI-assisted software development."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Phase 1 needs nothing but the standard library and git.
+# tomli is only required because the stdlib tomllib landed in 3.11.
+dependencies = [
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+traceflow = "traceflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Exactly one -q. Two would suppress the summary line, which the completion gate
+# reads to confirm tests actually ran.
+addopts = "-q --tb=short"
+# Every test that touches git builds a real repository, so a full run leaves several
+# thousand files in the temp tree. Keeping them only for failures avoids accumulating
+# them across runs, which otherwise makes each run slower than the last.
+tmp_path_retention_policy = "failed"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RET", "ARG", "PTH", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "S101"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+strict = true
+warn_unreachable = true
