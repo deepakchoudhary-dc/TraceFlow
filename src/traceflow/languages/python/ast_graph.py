@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from traceflow.blobs import digest_of
 from traceflow.config import Config
@@ -22,9 +22,40 @@ from traceflow.derived import AnalysisCache
 from traceflow.git.repository import Repository
 from traceflow.languages.base import ImportRef, ModuleAnalysis, module_analysis_from_json
 from traceflow.languages.python.analyzer import PythonAnalyzer
+from traceflow.languages.typescript.analyzer import TypeScriptAnalyzer
+from traceflow.languages.typescript.graph import (
+    TypeScriptFiles,
+    module_name_for,
+    resolve_specifier,
+)
+
+if TYPE_CHECKING:
+    from traceflow.languages.registry import Analyzer
 
 PACKAGE_MARKERS = frozenset({"__init__.py", "__init__.pyi"})
 PYTHON_SUFFIXES = (".py", ".pyi")
+
+
+def _default_registry() -> tuple[Analyzer, ...]:
+    """The registry, imported at call time.
+
+    Lazily, because the registry imports this package's analyzer, and an eager
+    import here would chase the registry through the package ``__init__`` while
+    that module is still being initialised. One indirection buys a clean import
+    order in both directions.
+    """
+    from traceflow.languages.registry import default_registry
+
+    return default_registry()
+
+
+def _analyzer_for(
+    path: str, entries: tuple[Analyzer, ...] | None
+) -> PythonAnalyzer | TypeScriptAnalyzer | None:
+    """The analyzer that handles *path* — see :func:`_default_registry` for the why."""
+    from traceflow.languages.registry import analyzer_for
+
+    return analyzer_for(path, entries)
 
 
 @dataclass(frozen=True)
@@ -283,8 +314,8 @@ def resolve_import(
     return None
 
 
-def list_python_files(repository: Repository) -> tuple[str, ...]:
-    """Every Python file git considers part of the repository, and that still exists.
+def list_repository_files(repository: Repository) -> tuple[str, ...]:
+    """Every file git considers part of the repository, and that still exists.
 
     ``--exclude-standard`` applies the repository's real ``.gitignore``, so build
     output and virtual environments are excluded by the same rules everything else
@@ -295,21 +326,37 @@ def list_python_files(repository: Repository) -> tuple[str, ...]:
     import resolving to it would then yield an edge to a file that is not there, leaving
     the graph internally inconsistent and hiding the now-broken import. TraceFlow observes
     the working tree, so the file list has to describe the working tree.
+
+    This is the *raw* listing: every language's inputs partition out of it, and the
+    configuration a resolver needs — a TypeScript ``tsconfig.json`` among them — is
+    still present, which a per-language filter would have removed.
     """
     output = repository.git("ls-files", "--cached", "--others", "--exclude-standard", "-z")
     paths = {normalise(item) for item in output.split("\0") if item}
+    return tuple(sorted(path for path in paths if (repository.root / path).is_file()))
+
+
+def list_supported_files(
+    repository: Repository, entries: tuple[Analyzer, ...] | None = None
+) -> tuple[str, ...]:
+    """The raw listing narrowed to files some analyzer claims."""
     return tuple(
-        sorted(
-            path
-            for path in paths
-            if path.endswith(PYTHON_SUFFIXES) and (repository.root / path).is_file()
-        )
+        path
+        for path in list_repository_files(repository)
+        if _analyzer_for(path, entries) is not None
+    )
+
+
+def list_python_files(repository: Repository) -> tuple[str, ...]:
+    """Every Python file in the repository, filtered from the supported listing."""
+    return tuple(
+        path for path in list_supported_files(repository) if path.endswith(PYTHON_SUFFIXES)
     )
 
 
 def analyze_cached(
     cache: AnalysisCache,
-    analyzer: PythonAnalyzer,
+    analyzer: PythonAnalyzer | TypeScriptAnalyzer,
     path: str,
     source: bytes,
     module_name: str | None,
@@ -337,23 +384,54 @@ def analyze_cached(
     return analysis
 
 
+def _module_name_for_path(
+    path: str, packages: frozenset[str], registry: tuple[Analyzer, ...]
+) -> str | None:
+    """The module name a file is imported under, in whichever language it is written."""
+    engine = _analyzer_for(path, registry)
+    if engine is not None and engine.name == "typescript":
+        return module_name_for(path)
+    names = module_names_for(path, packages)
+    # The shortest name is the one rooted at the shallowest non-package directory,
+    # which is how the module is actually imported in a src/ layout.
+    return names[-1] if names else None
+
+
 def build_dependency_graph(
     repository: Repository,
     cache: AnalysisCache,
     config: Config,
     analyzer: PythonAnalyzer | None = None,
     files: PythonFiles | None = None,
+    entries: tuple[Analyzer, ...] | None = None,
+    supported_paths: tuple[str, ...] | None = None,
 ) -> DependencyGraph:
-    """Parse every Python file in the repository and resolve the imports between them.
+    """Parse every supported file in the repository and resolve the imports between them.
 
-    *files* may be supplied by a caller that has already listed the repository, so a command
-    that runs several analyses over one tree lists it once.
+    *files* keeps its original meaning — a caller-supplied **Python** listing — and
+    produces a Python-only graph, exactly as it did before TypeScript existed.
+    *supported_paths* is the multi-language listing a caller made once; with neither,
+    the listing is made here. However it arrives, it is partitioned per language and
+    each language resolves with its own rules.
     """
-    engine = analyzer or PythonAnalyzer()
-    listing = files or PythonFiles.of(repository)
-    paths = listing.paths
-    packages = listing.packages
-    index = listing.index
+    registry = entries or _default_registry()
+
+    if files is not None:
+        paths = files.paths
+        packages = files.packages
+        index = files.index
+        ts_files: TypeScriptFiles | None = None
+    else:
+        if supported_paths is None:
+            supported_paths = list_repository_files(repository)
+        py_paths = tuple(p for p in supported_paths if p.endswith(PYTHON_SUFFIXES))
+        packages = package_directories(py_paths)
+        index = build_module_index(py_paths, packages)
+        paths = tuple(p for p in supported_paths if _analyzer_for(p, registry) is not None)
+        # The tsconfig discovery needs the raw listing — a tsconfig.json is not a
+        # file any analyzer claims, and an alias table read from nothing resolves
+        # nothing while looking exactly like a repository without aliases.
+        ts_files = TypeScriptFiles.of(supported_paths, repository)
 
     modules: list[ModuleNode] = []
     edges: list[ImportEdge] = []
@@ -361,6 +439,15 @@ def build_dependency_graph(
     parse_errors: list[str] = []
 
     for path in paths:
+        engine = (
+            _analyzer_for(path, registry)
+            if analyzer is None
+            else (analyzer if path.endswith(PYTHON_SUFFIXES) else None)
+        )
+        if engine is None:
+            # A caller pinned this graph to one analyzer (the legacy signature);
+            # files outside that language take no part in it.
+            continue
         absolute = repository.root / Path(path)
         try:
             if absolute.stat().st_size > config.analysis.max_file_size_bytes:
@@ -369,10 +456,7 @@ def build_dependency_graph(
         except OSError:
             continue
 
-        names = module_names_for(path, packages)
-        # The shortest name is the one rooted at the shallowest non-package directory,
-        # which is how the module is actually imported in a src/ layout.
-        module_name = names[-1] if names else None
+        module_name = _module_name_for_path(path, packages, registry)
 
         analysis = analyze_cached(cache, engine, path, source, module_name)
         if analysis.parse_error:
@@ -383,7 +467,14 @@ def build_dependency_graph(
         )
 
         for reference in analysis.imports:
-            target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
+            if engine.name == "typescript" and ts_files is not None:
+                target = resolve_specifier(
+                    reference.module, path, ts_files.index, ts_files.tsconfig
+                )
+            else:
+                target = resolve_import(
+                    reference, module_name, index, is_package=is_package_init(path)
+                )
             if target is None:
                 unresolved.append(UnresolvedImport(source_path=path, reference=reference))
                 continue

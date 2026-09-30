@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_git
+from traceflow.config import DEFAULT_IGNORE
 from traceflow.git.repository import (
     Repository,
     is_ignored_path,
@@ -219,6 +220,33 @@ def test_is_ignored_path(path: str, expected: bool) -> None:
 
 def test_is_ignored_path_with_empty_ignore_list() -> None:
     assert is_ignored_path(".traceflow/events.jsonl", ()) is False
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("ProU Assessment.docx", True),
+        ("docs/report.pdf", True),
+        ("assets/logo.PNG", True),  # suffix matching is case-insensitive
+        ("deep/nested/photo.jpeg", True),
+        ("bundle.Zip", True),
+        ("notes.txt", False),
+        ("report.pdfx", False),  # a suffix is not a substring
+        ("src/main.ts", False),
+        ("docx", False),  # the glob needs the dot
+    ],
+)
+def test_is_ignored_path_matches_suffix_globs(path: str, expected: bool) -> None:
+    assert is_ignored_path(path, ("*.docx", "*.pdf", "*.png", "*.jpeg", "*.zip")) is expected
+
+
+def test_default_ignore_covers_the_binary_noise_a_session_cannot_explain() -> None:
+    """The kinds the ProU run surfaced — .docx/.pdf — are ignored out of the box."""
+    for path in ("assessment.docx", "spec.PDF", "icon.ico", "font.woff2", ".traceflow/x"):
+        assert is_ignored_path(path, DEFAULT_IGNORE) is True
+    # Source files are never ignored by default, whatever their name looks like.
+    for path in ("main.py", "index.ts", "TaskForm.tsx", "report.md"):
+        assert is_ignored_path(path, DEFAULT_IGNORE) is False
 
 
 # --------------------------------------------------------------------------- porcelain parsing

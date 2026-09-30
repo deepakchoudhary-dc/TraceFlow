@@ -47,8 +47,8 @@ from traceflow.git.diff import ChangeSet, collect_changes
 from traceflow.git.repository import GitError, Repository, WorkingTreeState
 from traceflow.languages.python.ast_graph import (
     DependencyGraph,
-    PythonFiles,
     build_dependency_graph,
+    list_repository_files,
 )
 from traceflow.scaffold import gitignore_has_entry, initialise
 from traceflow.stamps import now_iso
@@ -489,14 +489,18 @@ def _analyse_session(
     a subtler risk: three listings taken at three instants can disagree if the tree moves
     underneath, leaving the analysis reasoning from two pictures of the repository.
     """
-    files = PythonFiles.of(repository)
+    # One listing for every pass over the tree: symbols, graph and impact all
+    # partition it per language rather than each spawning git for their own view.
+    # The *raw* listing is what travels — tsconfig.json rides along in it, which
+    # is what keeps alias resolution alive inside the watch loop.
+    supported = list_repository_files(repository)
     session = analyse_session_modules(
-        repository, baseline, changes, blobs, cache, config, files=files
+        repository, baseline, changes, blobs, cache, config, supported_paths=supported
     )
     symbols = symbol_report_from_session(session)
 
     if graph is None or graph_is_stale(session):
-        graph = build_dependency_graph(repository, cache, config, files=files)
+        graph = build_dependency_graph(repository, cache, config, supported_paths=supported)
 
     impact = build_impact_report(
         repository,
@@ -507,7 +511,7 @@ def _analyse_session(
         config,
         graph=graph,
         session=session,
-        files=files,
+        supported_paths=supported,
     )
     return _SessionFindings(changes=changes, symbols=symbols, impact=impact, graph=graph)
 
@@ -1299,7 +1303,12 @@ def _cmd_graph(args: argparse.Namespace) -> int:
 
     config = load_config(repository.root)
     store = SessionStore(repository.root)
-    graph = build_dependency_graph(repository, AnalysisCache(store.state_dir), config)
+    graph = build_dependency_graph(
+        repository,
+        AnalysisCache(store.state_dir),
+        config,
+        supported_paths=list_repository_files(repository),
+    )
 
     print(f"TraceFlow {__version__} — dependency graph")
     print(_rule())

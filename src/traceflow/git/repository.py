@@ -153,11 +153,26 @@ def _normalise(path: str) -> str:
 
 
 def is_ignored_path(path: str, ignore: tuple[str, ...]) -> bool:
-    """True when *path* falls under one of the ignored prefixes."""
+    """True when *path* falls under one of the ignore entries.
+
+    An entry is a directory or path prefix (``.traceflow``, ``build/temp``) — the
+    original, load-bearing rule that keeps TraceFlow's own writes out of its own
+    sessions — or a ``*``-prefixed suffix glob (``*.pdf``) for the file kinds tools
+    move but never explain. The suffix test is case-insensitive on both sides:
+    ``Camera.JPG`` is as much binary noise as ``logo.png``, and a rule that only
+    matched lowercase would put the file straight back into every session.
+    """
     normalised = _normalise(path)
+    lowered = normalised.lower()
     for prefix in ignore:
         cleaned = _normalise(prefix)
-        if cleaned and (normalised == cleaned or normalised.startswith(f"{cleaned}/")):
+        if not cleaned:
+            continue
+        if cleaned.startswith("*"):
+            if lowered.endswith(cleaned[1:].lower()):
+                return True
+            continue
+        if normalised == cleaned or normalised.startswith(f"{cleaned}/"):
             return True
     return False
 

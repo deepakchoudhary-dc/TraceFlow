@@ -116,13 +116,47 @@ class Config:
     ignore: tuple[str, ...]
 
 
-# The default ignore list exists for one reason: TraceFlow must never mistake its
-# own writes for repository activity. Without this, writing a session record
-# changes the working tree, which registers as activity, which starts a new
-# session — an unbounded self-triggering loop. ``traceflow init`` also adds the
-# state directory to the target's .gitignore, but that is a convenience; this
-# filter is the guarantee.
-DEFAULT_IGNORE: tuple[str, ...] = (STATE_DIRNAME,)
+# The default ignore list exists for two reasons. The first is a guarantee:
+# TraceFlow must never mistake its own writes for repository activity — without
+# the state directory here, writing a session record changes the working tree,
+# which registers as activity, which starts a new session, forever. The second is
+# a lesson from watching real agent sessions: a few file kinds are *moved*, never
+# edited, by every tool in the loop — compiled bytecode, office documents a spec
+# lives in, image assets a screenshot step rewrites. They appear in every session
+# and explain nothing. An entry is either an exact path, a directory prefix, or a
+# suffix beginning with ``*`` (``*.pdf``); anything a project genuinely edits
+# belongs to a session, so the default list is deliberately short.
+DEFAULT_IGNORE: tuple[str, ...] = (
+    STATE_DIRNAME,
+    "*.doc",
+    "*.docx",
+    "*.pdf",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.ico",
+    "*.svg",
+    "*.webp",
+    "*.mp4",
+    "*.mov",
+    "*.zip",
+    "*.gz",
+    "*.7z",
+    "*.exe",
+    "*.dll",
+    "*.so",
+    "*.dylib",
+    "*.class",
+    "*.jar",
+    "*.pyc",
+    "*.pyo",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.otf",
+    "*.eot",
+)
 
 
 def default_config() -> Config:

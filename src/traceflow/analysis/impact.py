@@ -89,10 +89,19 @@ from traceflow.languages.python.ast_graph import (
     build_dependency_graph,
     build_module_index,
     is_package_init,
+    list_repository_files,
     module_names_for,
     package_directories,
     resolve_import,
 )
+from traceflow.languages.registry import Analyzer, analyzer_for, default_registry
+from traceflow.languages.typescript.graph import (
+    TYPESCRIPT_SUFFIXES,
+    TypeScriptFiles,
+    build_ts_index,
+    resolve_specifier,
+)
+from traceflow.languages.typescript.graph import module_name_for as ts_module_name
 
 #: How many limitations are recorded before the rest are summarised as a count. A report
 #: listing three hundred dynamic call sites is not more honest than one listing twenty and
@@ -224,6 +233,8 @@ def resolve_call(
     index: dict[str, str],
     path: str,
     symbols_for: Callable[[str], tuple[Symbol, ...]],
+    ts_files: TypeScriptFiles | None = None,
+    registry: tuple[Analyzer, ...] | None = None,
 ) -> CallResolution | None:
     """Work out which file a call expression reaches, as far as the text allows.
 
@@ -236,7 +247,11 @@ def resolve_call(
     reference = bound_imports(analysis).get(root)
 
     if reference is not None:
-        target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
+        engine = analyzer_for(path, registry) if registry else None
+        if ts_files is not None and engine is not None and engine.name == "typescript":
+            target = resolve_specifier(reference.module, path, ts_files.index, ts_files.tsconfig)
+        else:
+            target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
         if target is not None:
             remaining = tuple(parts[1:])
             if not remaining:
@@ -347,20 +362,27 @@ class _ModuleLoader:
     """
 
     def __init__(
-        self, repository: Repository, cache: AnalysisCache, config: Config, engine: PythonAnalyzer
+        self,
+        repository: Repository,
+        cache: AnalysisCache,
+        config: Config,
+        registry: tuple[Analyzer, ...] | None = None,
     ) -> None:
         self._repository = repository
         self._cache = cache
         self._config = config
-        self._engine = engine
+        self._registry = registry if registry is not None else default_registry()
         self._loaded: dict[str, ModuleAnalysis | None] = {}
 
-    def __call__(self, path: str, module_name: str | None) -> ModuleAnalysis | None:
+    def __call__(self, path: str) -> ModuleAnalysis | None:
         if path not in self._loaded:
-            self._loaded[path] = self._read(path, module_name)
+            self._loaded[path] = self._read(path)
         return self._loaded[path]
 
-    def _read(self, path: str, module_name: str | None) -> ModuleAnalysis | None:
+    def _read(self, path: str) -> ModuleAnalysis | None:
+        engine = analyzer_for(path, self._registry)
+        if engine is None:
+            return None
         absolute = self._repository.root / path
         try:
             if absolute.stat().st_size > self._config.analysis.max_file_size_bytes:
@@ -368,10 +390,23 @@ class _ModuleLoader:
             source = absolute.read_bytes()
         except OSError:
             return None
-        return analyze_cached(self._cache, self._engine, path, source, module_name)
+        return analyze_cached(self._cache, engine, path, source, None)
 
 
-def _module_name_for(path: str, packages: frozenset[str]) -> str | None:
+def _module_name_for(
+    path: str,
+    packages: frozenset[str],
+    registry: tuple[Analyzer, ...] | None = None,
+) -> str | None:
+    """The name a file is imported under, in whichever language it is written.
+
+    *registry* of ``None`` asks the Python question only, which is what every caller
+    before TypeScript existed meant.
+    """
+    if registry is not None:
+        engine = analyzer_for(path, registry)
+        if engine is not None and engine.name == "typescript":
+            return ts_module_name(path)
     names = module_names_for(path, packages)
     return names[-1] if names else None
 
@@ -543,6 +578,8 @@ def _dangling_imports(
     session: SessionAnalysis,
     packages: frozenset[str],
     current_paths: tuple[str, ...],
+    ts_files: TypeScriptFiles | None = None,
+    registry: tuple[Analyzer, ...] | None = None,
 ) -> list[tuple[str, str, int, str]]:
     """Files left importing a module this session removed.
 
@@ -563,12 +600,28 @@ def _dangling_imports(
     pre_paths = tuple({*current_paths, *departed})
     pre_index = build_module_index(pre_paths, package_directories(pre_paths))
 
+    # The same reconstruction, in TypeScript terms: an index of every script file
+    # that existed *before* the session, so an import of a deleted module resolves
+    # against the index in which it was still there. The tsconfig aliases did not
+    # depend on the session's file changes, so the current ones are reused.
+    ts_pre_index: dict[str, str] = {}
+    if ts_files is not None:
+        ts_pre_index = build_ts_index(
+            tuple(p for p in pre_paths if p.endswith(TYPESCRIPT_SUFFIXES))
+        )
+
     found: list[tuple[str, str, int, str]] = []
     for item in graph.unresolved:
-        importing = _module_name_for(item.source_path, packages)
-        target = resolve_import(
-            item.reference, importing, pre_index, is_package=is_package_init(item.source_path)
-        )
+        engine = analyzer_for(item.source_path, registry) if registry else None
+        if ts_files is not None and engine is not None and engine.name == "typescript":
+            target = resolve_specifier(
+                item.reference.module, item.source_path, ts_pre_index, ts_files.tsconfig
+            )
+        else:
+            importing = _module_name_for(item.source_path, packages, registry)
+            target = resolve_import(
+                item.reference, importing, pre_index, is_package=is_package_init(item.source_path)
+            )
         if target is not None and target in departed:
             found.append((item.source_path, target, item.line, item.module))
     return sorted(set(found))
@@ -579,6 +632,8 @@ def _edges_of(
     module_name: str | None,
     index: dict[str, str],
     path: str,
+    ts_files: TypeScriptFiles | None = None,
+    registry: tuple[Analyzer, ...] | None = None,
 ) -> dict[str, tuple[str, int]]:
     """Outgoing dependencies keyed by target file, because that is what a relationship is.
 
@@ -586,13 +641,18 @@ def _edges_of(
     importing the same module twice, does not read as a structural change.
 
     *path* is the file these edges leave, which is what says whether a relative import
-    starts at its own package.
+    starts at its own package — and which language's resolver answers the question.
     """
     if analysis is None:
         return {}
+    engine = analyzer_for(path, registry) if registry else None
+    use_ts = ts_files is not None and engine is not None and engine.name == "typescript"
     edges: dict[str, tuple[str, int]] = {}
     for reference in analysis.imports:
-        target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
+        if use_ts and ts_files is not None:
+            target = resolve_specifier(reference.module, path, ts_files.index, ts_files.tsconfig)
+        else:
+            target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
         if target is not None:
             edges.setdefault(target, (reference.module, reference.line))
     return edges
@@ -607,6 +667,8 @@ def _graph_diff(
     session: SessionAnalysis,
     index: dict[str, str],
     packages: frozenset[str],
+    ts_files: TypeScriptFiles | None = None,
+    registry: tuple[Analyzer, ...] | None = None,
 ) -> GraphDiff:
     """Compare the changed files' dependencies before and after (plan.md §28).
 
@@ -631,12 +693,19 @@ def _graph_diff(
 
     for module in session.modules:
         before_name = (
-            _module_name_for(module.original_path, packages)
+            _module_name_for(module.original_path, packages, registry)
             if module.original_path
             else module.module_name
         )
-        before = _edges_of(module.before, before_name, index, module.original_path or module.path)
-        after = _edges_of(module.after, module.module_name, index, module.path)
+        before = _edges_of(
+            module.before,
+            before_name,
+            index,
+            module.original_path or module.path,
+            ts_files,
+            registry,
+        )
+        after = _edges_of(module.after, module.module_name, index, module.path, ts_files, registry)
 
         for target, (text, line) in after.items():
             if target not in before:
@@ -808,24 +877,70 @@ def build_impact_report(
     session: SessionAnalysis | None = None,
     analyzer: PythonAnalyzer | None = None,
     files: PythonFiles | None = None,
+    supported_paths: tuple[str, ...] | None = None,
+    entries: tuple[Analyzer, ...] | None = None,
 ) -> ImpactReport:
     """Walk from the session's changed symbols to everything they reach.
 
     *graph* and *session* may be supplied by a caller that has already produced them. That
-    matters because a watcher closes many sessions in a row: the graph parses every Python
-    file in the repository and the session analysis reads every changed one, so deriving
-    both here is right for a one-shot command and wrong inside a watch loop. A caller that
-    supplies them is responsible for rebuilding when :func:`graph_is_stale` says to.
+    matters because a watcher closes many sessions in a row: the graph parses every
+    supported source file in the repository and the session analysis reads every changed
+    one, so deriving both here is right for a one-shot command and wrong inside a watch
+    loop. A caller that supplies them is responsible for rebuilding when
+    :func:`graph_is_stale` says to.
 
-    *files* is the repository listing, and may be supplied for the same reason: it is one git
-    call, and a caller running several passes over one tree should make it once.
+    *files* keeps its original meaning — a caller-supplied **Python** listing — and pins
+    the report to Python, exactly as before TypeScript existed. *supported_paths* is the
+    newer form of the same favour: the multi-language listing a caller made once and
+    passes to every pass over one tree. Passing both is not allowed; the Python pin wins
+    with an error, because silently ignoring one of them would mislead the caller about
+    what was analysed.
     """
-    engine = analyzer or PythonAnalyzer()
-    listing = files or PythonFiles.of(repository)
+    if files is not None and supported_paths is not None:
+        raise ValueError("pass either files= or supported_paths=, not both")
+
+    registry = entries or default_registry()
+    ts_files: TypeScriptFiles | None = None
+    listing: PythonFiles
+
+    if files is not None:
+        listing = files
+    else:
+        if supported_paths is None:
+            supported_paths = list_repository_files(repository)
+        py_paths = tuple(p for p in supported_paths if p.endswith((".py", ".pyi")))
+        py_packages = package_directories(py_paths)
+        listing = PythonFiles(
+            paths=py_paths,
+            packages=py_packages,
+            index=build_module_index(py_paths, py_packages),
+        )
+        # Built from the *raw* listing: tsconfig.json is not a file any analyzer
+        # claims, and alias resolution without it resolves nothing while looking
+        # exactly like a repository that never declared an alias.
+        ts_files = TypeScriptFiles.of(supported_paths, repository)
+
     session_analysis = session or analyse_session_modules(
-        repository, baseline, change_set, blobs, cache, config, engine, files=listing
+        repository,
+        baseline,
+        change_set,
+        blobs,
+        cache,
+        config,
+        analyzer,
+        files=files,
+        entries=registry,
+        supported_paths=supported_paths if files is None else None,
     )
-    dependency_graph = graph or build_dependency_graph(repository, cache, config, engine, listing)
+    dependency_graph = graph or build_dependency_graph(
+        repository,
+        cache,
+        config,
+        analyzer,
+        files=listing if files is not None else None,
+        entries=registry,
+        supported_paths=supported_paths if files is None else None,
+    )
 
     current_paths = listing.paths
     packages = listing.packages
@@ -834,13 +949,13 @@ def build_impact_report(
     analyses: dict[str, ModuleAnalysis] = {
         module.path: module.after for module in session_analysis.modules if module.after is not None
     }
-    loader = _ModuleLoader(repository, cache, config, engine)
+    loader = _ModuleLoader(repository, cache, config, registry)
 
     def analysis_of(path: str) -> ModuleAnalysis | None:
         """A file's current analysis, reusing the session's when it already has one."""
         analysis = analyses.get(path)
         if analysis is None:
-            analysis = loader(path, _module_name_for(path, packages))
+            analysis = loader(path)
         return analysis
 
     def symbols_for(path: str) -> tuple[Symbol, ...]:
@@ -881,7 +996,14 @@ def build_impact_report(
 
                 for call in analysis.calls:
                     resolution = resolve_call(
-                        call.name, analysis, module_name, index, source, symbols_for
+                        call.name,
+                        analysis,
+                        module_name,
+                        index,
+                        source,
+                        symbols_for,
+                        ts_files,
+                        registry,
                     )
                     if resolution is None or resolution.path != entry.path:
                         continue
@@ -964,7 +1086,14 @@ def build_impact_report(
 
         frontier = following
 
-    dangling = _dangling_imports(dependency_graph, session_analysis, packages, current_paths)
+    dangling = _dangling_imports(
+        dependency_graph,
+        session_analysis,
+        packages,
+        current_paths,
+        ts_files,
+        registry,
+    )
     for source, target, line, module_text in dangling:
         evidence = (
             Evidence(
@@ -1043,7 +1172,7 @@ def build_impact_report(
         analyzer=session_analysis.analyzer,
         changed_files=tuple(change.path for change in change_set.files),
         nodes=tuple(nodes),
-        graph_diff=_graph_diff(change_set, session_analysis, index, packages),
+        graph_diff=_graph_diff(change_set, session_analysis, index, packages, ts_files, registry),
         limitations=_limitations(
             len(external),
             session_analysis,

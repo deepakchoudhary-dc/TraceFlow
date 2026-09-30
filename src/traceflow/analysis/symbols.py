@@ -40,8 +40,13 @@ from traceflow.languages.python.analyzer import PythonAnalyzer
 from traceflow.languages.python.ast_graph import (
     PythonFiles,
     analyze_cached,
+    list_repository_files,
     module_names_for,
+    package_directories,
 )
+from traceflow.languages.registry import Analyzer, analyzer_for, default_registry
+from traceflow.languages.typescript.analyzer import TypeScriptAnalyzer
+from traceflow.languages.typescript.graph import module_name_for
 
 
 @dataclass(frozen=True)
@@ -225,26 +230,49 @@ def analyse_session_modules(
     config: Config,
     analyzer: PythonAnalyzer | None = None,
     files: PythonFiles | None = None,
+    entries: tuple[Analyzer, ...] | None = None,
+    supported_paths: tuple[str, ...] | None = None,
 ) -> SessionAnalysis:
-    """Analyse both versions of every changed file the analyzer can handle.
+    """Analyse both versions of every changed file the analyzers can handle.
 
-    *files* may be supplied by a caller that has already listed the repository: the package
-    layout is needed here and the whole listing is needed downstream, and a git spawn is
-    expensive enough that listing the same tree three times per command is worth avoiding.
+    Each changed file is dispatched to the language that claims it, so a session that
+    edits Python and TypeScript together is one comparison over both.
+
+    *files* keeps its original meaning — a caller-supplied **Python** listing — and pins
+    the pass to Python, exactly as before TypeScript existed. *supported_paths* is the
+    multi-language listing a caller made once; without either, the repository is listed
+    here (a git spawn is expensive enough that one listing per command is worth
+    structuring around).
     """
-    engine = analyzer or PythonAnalyzer()
-    packages = (files or PythonFiles.of(repository)).packages
+    registry = entries or default_registry()
+    if files is not None:
+        packages = files.packages
+    else:
+        if supported_paths is None:
+            supported_paths = list_repository_files(repository)
+        py_paths = tuple(p for p in supported_paths if p.endswith((".py", ".pyi")))
+        packages = package_directories(py_paths)
 
     modules: list[SessionModule] = []
     parse_errors: list[str] = []
     skipped: list[str] = []
+    used_kinds: set[str] = set()
 
     for change in change_set.files:
-        if not engine.can_analyze(change.path):
+        engine: PythonAnalyzer | TypeScriptAnalyzer | None
+        if analyzer is not None and change.path.endswith((".py", ".pyi")):
+            engine = analyzer
+        else:
+            engine = analyzer_for(change.path, registry)
+        if engine is None:
             continue
 
-        names = module_names_for(change.path, packages)
-        module_name = names[-1] if names else None
+        module_name: str | None
+        if engine.name == "typescript":
+            module_name = module_name_for(change.path)
+        else:
+            names = module_names_for(change.path, packages)
+            module_name = names[-1] if names else None
 
         # A rename is compared against the file's content under its old name, which is
         # where the baseline recorded it.
@@ -289,6 +317,7 @@ def analyse_session_modules(
         if changes.parse_error:
             parse_errors.append(f"{change.path}: {changes.parse_error}")
 
+        used_kinds.add(engine.cache_kind)
         modules.append(
             SessionModule(
                 path=change.path,
@@ -301,8 +330,13 @@ def analyse_session_modules(
             )
         )
 
+    if used_kinds:
+        analyzer_label = "+".join(sorted(used_kinds))
+    else:
+        analyzer_label = "+".join(sorted(engine.cache_kind for engine in registry))
+
     return SessionAnalysis(
-        analyzer=engine.cache_kind,
+        analyzer=analyzer_label,
         modules=tuple(modules),
         parse_errors=tuple(parse_errors),
         skipped=tuple(skipped),

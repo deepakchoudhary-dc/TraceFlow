@@ -28,7 +28,7 @@ LLM in the analysis engine.
 
 ## Status
 
-**Phases 0–8 complete — the MVP workflow works end to end.**
+**Phases 0–8 complete, and Phase 10 (TypeScript/JavaScript) is in.**
 
 TraceFlow currently:
 
@@ -40,7 +40,11 @@ TraceFlow currently:
   already present out of the answer
 - resolves that down to **symbols**: which functions, methods and classes were added,
   removed, re-declared, or rewritten
-- builds the repository's import graph on demand
+- analyses **TypeScript, TSX and JavaScript** beside Python: ES modules, CommonJS
+  `require`, `import type`, dynamic `import()`, JSX, arrow functions, class members —
+  with import resolution across relative paths, directory indexes and tsconfig
+  `paths`/`baseUrl` aliases
+- builds the repository's import graph on demand, in every supported language
 - walks that graph from the changed symbols to everything they **reach**, separating
   obligations from possibilities and saying where static analysis is blind
 - records the **task you gave the agent** and compares it with what actually changed —
@@ -55,7 +59,7 @@ TraceFlow currently:
   what it reaches, with the before/after comparison beside it — and exports it to
   Excalidraw, JSON or SVG
 
-Phases 9–10 are post-MVP: an optional AI explanation layer, and additional languages.
+Phase 9 (an optional AI explanation layer) and further languages are post-MVP.
 
 ---
 
@@ -571,7 +575,7 @@ There are no runtime dependencies. Phase 1 needs the standard library, `git`, an
 | 7 | Intent vs actual change | **done** |
 | 8 | Test evidence | **done** |
 | 9 | Optional AI explanation layer | planned |
-| 10 | Additional languages | planned |
+| 10 | Additional languages: **TypeScript/TSX/JavaScript done** — Go, Java, Rust, C# planned | **TypeScript done** |
 
 ---
 
@@ -588,9 +592,13 @@ There are no runtime dependencies. Phase 1 needs the standard library, `git`, an
 - **Focused, not exhaustive.** The visualisation follows the change, not the
   repository. A 50,000-node graph is a worse experience than no graph.
 - **Language adapters, not a pretend-universal parser.** Python is analysed with the
-  standard library's `ast`. `plan.md` §6 requires an interface rather than a claim, so
+  standard library's `ast`. TypeScript/TSX/JavaScript are analysed with a
+  scanner that understands strings, templates, comments and regex literals — a
+  deliberate scope, stated in its docstring, rather than a claim to parse the whole
+  language. `plan.md` §6 requires an interface rather than a claim, so
   `languages/base.py` defines what an analyzer must provide and each language
-  implements it — a second language is a new subpackage, not a rewrite.
+  implements it — a new language is a new subpackage plus one registry entry, not a
+  rewrite.
 - **Local by default.** Source code does not leave the machine.
 
 ---

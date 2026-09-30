@@ -93,7 +93,11 @@ CONFIDENCE_ORDER: dict[Confidence, int] = {
     Confidence.UNKNOWN: 4,
 }
 
-_TEST_DIRECTORIES = frozenset({"test", "tests"})
+_TEST_DIRECTORIES = frozenset({"test", "tests", "__tests__"})
+
+#: Suffixes a JavaScript/TypeScript test file may end on, after ``.test``/``.spec``
+#: or as a bare ``test.*`` entry — the conventions Jest, Vitest and node:test share.
+_SCRIPT_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
 
 _DEPENDENCY_MANIFESTS = frozenset(
     {
@@ -416,14 +420,21 @@ class ImpactReport:
 def is_test_path(path: str) -> bool:
     """True when *path* is a test.
 
-    Deliberately conservative. A directory literally named ``test`` or ``tests``, or a file
-    named ``test_*.py`` / ``*_test.py`` / ``conftest.py``, is a test. Matching the substring
-    "test" anywhere would classify ``latest/`` as a test directory and turn the TESTS
-    section into noise.
+    Deliberately conservative, in whichever language the file is written. A directory
+    literally named ``test``, ``tests`` or ``__tests__`` is a test directory; Python
+    contributes ``test_*.py`` / ``*_test.py`` / ``conftest.py``, and the JavaScript
+    family contributes ``*.test.*``, ``*.spec.*`` and bare ``test.*`` entries. Matching
+    the substring "test" anywhere would classify ``latest/`` as a test directory and
+    turn the TESTS section into noise.
     """
     normalised = normalise(path)
     name = normalised.rsplit("/", 1)[-1]
+    lowered = name.lower()
     if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if ".test." in lowered or ".spec." in lowered:
+        return True
+    if lowered.startswith("test.") and lowered.endswith(_SCRIPT_SUFFIXES):
         return True
     return any(part in _TEST_DIRECTORIES for part in normalised.split("/")[:-1])
 
