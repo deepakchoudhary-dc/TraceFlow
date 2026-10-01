@@ -36,7 +36,7 @@ from traceflow.languages.base import (
     SymbolChangeKind,
     diff_module_analysis,
 )
-from traceflow.languages.python.analyzer import PythonAnalyzer
+from traceflow.languages.cfamily.graph import CFamilyFiles, cfamily_languages_for
 from traceflow.languages.python.ast_graph import (
     PythonFiles,
     analyze_cached,
@@ -45,7 +45,6 @@ from traceflow.languages.python.ast_graph import (
     package_directories,
 )
 from traceflow.languages.registry import Analyzer, analyzer_for, default_registry
-from traceflow.languages.typescript.analyzer import TypeScriptAnalyzer
 from traceflow.languages.typescript.graph import module_name_for
 
 
@@ -228,7 +227,7 @@ def analyse_session_modules(
     blobs: BlobStore,
     cache: AnalysisCache,
     config: Config,
-    analyzer: PythonAnalyzer | None = None,
+    analyzer: Analyzer | None = None,
     files: PythonFiles | None = None,
     entries: tuple[Analyzer, ...] | None = None,
     supported_paths: tuple[str, ...] | None = None,
@@ -245,6 +244,11 @@ def analyse_session_modules(
     structuring around).
     """
     registry = entries or default_registry()
+    if files is not None and supported_paths is not None:
+        # The same rule as the impact engine: passing both forms asks for one
+        # repository and receives two, and a resolver cannot say which one to
+        # answer for. A caller that passes both has made an error worth naming.
+        raise ValueError("pass either files= or supported_paths=, not both")
     if files is not None:
         packages = files.packages
     else:
@@ -259,9 +263,11 @@ def analyse_session_modules(
     used_kinds: set[str] = set()
 
     for change in change_set.files:
-        engine: PythonAnalyzer | TypeScriptAnalyzer | None
-        if analyzer is not None and change.path.endswith((".py", ".pyi")):
-            engine = analyzer
+        engine: Analyzer | None
+        if analyzer is not None:
+            # A caller pinned the pass to one analyzer: files outside its language
+            # take no part, exactly as in the graph builder.
+            engine = analyzer if analyzer.can_analyze(change.path) else None
         else:
             engine = analyzer_for(change.path, registry)
         if engine is None:
@@ -270,6 +276,8 @@ def analyse_session_modules(
         module_name: str | None
         if engine.name == "typescript":
             module_name = module_name_for(change.path)
+        elif cfamily_languages_for(change.path) is not None:
+            module_name = CFamilyFiles.module_name_for(change.path)
         else:
             names = module_names_for(change.path, packages)
             module_name = names[-1] if names else None
@@ -370,7 +378,7 @@ def collect_symbol_changes(
     blobs: BlobStore,
     cache: AnalysisCache,
     config: Config,
-    analyzer: PythonAnalyzer | None = None,
+    analyzer: Analyzer | None = None,
 ) -> SymbolReport:
     """Compare the baseline and current versions of every changed Python file.
 

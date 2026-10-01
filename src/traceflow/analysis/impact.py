@@ -81,6 +81,7 @@ from traceflow.languages.base import (
     SymbolChange,
     SymbolChangeKind,
 )
+from traceflow.languages.cfamily.graph import CFamilyFiles, cfamily_languages_for
 from traceflow.languages.python.analyzer import PythonAnalyzer
 from traceflow.languages.python.ast_graph import (
     DependencyGraph,
@@ -155,7 +156,7 @@ _DYNAMIC_DISPATCH = frozenset(
 # --------------------------------------------------------------------------- call resolution
 
 
-def bound_name(reference: ImportRef) -> str | None:
+def bound_name(reference: ImportRef, path: str | None = None) -> str | None:
     """The local name an import statement binds in the importing module.
 
     ==================================  ==================
@@ -167,27 +168,41 @@ def bound_name(reference: ImportRef) -> str | None:
     ``from a import b as c``            ``c``
     ``from . import b``                 ``b``
     ``from a import *``                 nothing — reported as a limitation
+    ``import "p"`` (Go)                 nothing — the path is not a name
+    ``import a.b.C`` (Java)             ``C`` — the class, which calls name directly
     ==================================  ==================
+
+    Go's imports bind nothing: the identifier used at a call site is the *package
+    name*, the last segment of the imported path, and the import does not name it
+    as a local — Go call resolution falls to package-name matching below. Java is
+    the opposite extreme: ``import com.example.db.Store`` exists so the file can
+    write ``Store.query(...)``, so the binding is the *last* segment, not Python's
+    first.
     """
     if reference.name is None:
         if not reference.module:
             return None
+        if path is not None and path.endswith(".go"):
+            return None
+        if path is not None and path.endswith(".java"):
+            return reference.alias or reference.module.rsplit(".", 1)[-1]
         return reference.alias or reference.module.split(".")[0]
     if reference.name == "*":
         return None
     return reference.alias or reference.name
 
 
-def bound_imports(analysis: ModuleAnalysis) -> dict[str, ImportRef]:
+def bound_imports(analysis: ModuleAnalysis, path: str | None = None) -> dict[str, ImportRef]:
     """Map each locally bound name to the import that binds it.
 
     Last binding wins, because that is what Python does: importing the same name twice
     leaves the second import in effect, so resolving to the first would point at a
-    binding the module no longer has.
+    binding the module no longer has. *path*, when given, lets language shapes into
+    the rule — a Go import binds nothing (see :func:`bound_name`).
     """
     bindings: dict[str, ImportRef] = {}
     for reference in analysis.imports:
-        name = bound_name(reference)
+        name = bound_name(reference, path)
         if name is not None:
             bindings[name] = reference
     return bindings
@@ -235,6 +250,7 @@ def resolve_call(
     symbols_for: Callable[[str], tuple[Symbol, ...]],
     ts_files: TypeScriptFiles | None = None,
     registry: tuple[Analyzer, ...] | None = None,
+    cfamily_files: CFamilyFiles | None = None,
 ) -> CallResolution | None:
     """Work out which file a call expression reaches, as far as the text allows.
 
@@ -242,14 +258,38 @@ def resolve_call(
     no static name — the honest answer, and the reason ``limitations`` exists rather than a
     guess being emitted here.
     """
+    # Rust writes its call chains with ``::`` (``service::login(...)``); every other
+    # name these resolvers match — imports, symbols — is dot-separated already, so
+    # the chain is folded once here rather than at each comparison below.
+    if cfamily_files is not None and cfamily_languages_for(path) is not None:
+        call_name = call_name.replace("::", ".")
     parts = call_name.split(".")
     root = parts[0]
-    reference = bound_imports(analysis).get(root)
+    reference = bound_imports(analysis, path).get(root)
 
     if reference is not None:
         engine = analyzer_for(path, registry) if registry else None
         if ts_files is not None and engine is not None and engine.name == "typescript":
             target = resolve_specifier(reference.module, path, ts_files.index, ts_files.tsconfig)
+        elif cfamily_files is not None and cfamily_languages_for(path) is not None:
+            target = cfamily_files.resolve(reference.module, path)
+            if target is not None and not parts[1:]:
+                # ``Service(...)`` — the imported name itself is the callee, and its
+                # name in the target is the *imported* name rather than the local
+                # alias: a call to a symbol this session removed must still be found,
+                # and the candidate is only ever matched against changed symbols.
+                imported = reference.module.rsplit(".", 1)[-1]
+                names = tuple(
+                    symbol.qualified_name
+                    for symbol in symbols_for(target)
+                    if symbol.name == imported
+                )
+                return CallResolution(
+                    path=target,
+                    names=names or (imported,),
+                    confidence=Confidence.CONFIRMED,
+                    detail=f"'{root}' is bound to {imported} by an import statement",
+                )
         else:
             target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
         if target is not None:
@@ -312,6 +352,66 @@ def resolve_call(
                 confidence=Confidence.HIGH_CONFIDENCE,
                 detail=f"'{root}' is defined in this module",
             )
+
+    # The cfamily fallbacks, in the order the languages write their calls.
+    if cfamily_files is not None and cfamily_languages_for(path) is not None:
+        # A call whose root names a symbol of an imported file: Java's and C#'s
+        # static calls — ``Repo.Validate(...)`` where an import (or a shared
+        # namespace) makes ``Repo`` reachable. Each import is resolved to its
+        # file and the root matched against that file's symbols; the tail rides
+        # along as candidate names, and the answer is inferred, because the same
+        # name may exist elsewhere.
+        for candidate_import in analysis.imports:
+            target = cfamily_files.resolve(candidate_import.module, path)
+            if target is None:
+                continue
+            if any(symbol.name == root for symbol in symbols_for(target)):
+                return CallResolution(
+                    path=target,
+                    names=_candidate_names(tuple(parts[1:]), symbols_for(target))
+                    if parts[1:]
+                    else (root,),
+                    confidence=Confidence.INFERRED,
+                    detail=f"'{root}' is defined in {target}, imported by this file",
+                )
+
+        # Go across packages: imports bind nothing, so the call's root is matched
+        # against each import's *package name* — the last path segment, which is
+        # the identifier Go programs actually write — and the import resolves to
+        # its package's file. The tail is offered to the target's symbols exactly
+        # as an imported dotted call is.
+        if len(parts) >= 2:
+            for candidate_import in analysis.imports:
+                package = candidate_import.module.rstrip("/").rsplit("/", 1)[-1]
+                if package != root:
+                    continue
+                target = cfamily_files.resolve(candidate_import.module, path)
+                if target is None:
+                    continue
+                symbols = symbols_for(target)
+                known = any(symbol.name in parts[1:] for symbol in symbols)
+                return CallResolution(
+                    path=target,
+                    names=_candidate_names(tuple(parts[1:]), symbols),
+                    confidence=Confidence.CONFIRMED if known else Confidence.INFERRED,
+                    detail=f"'{root}' is the package imported from {candidate_import.module}",
+                )
+
+        # The same-package (Go) and same-namespace (C#) call: no import binds the
+        # name because none is needed — the callee lives in a sibling file. The
+        # root is matched against each sibling's symbols and the first file that
+        # defines it is the answer. Inferred, because two siblings defining the
+        # same name is legal; a changed symbol of that name in one of them is
+        # still the finding, and the candidate match keeps it from inventing one.
+        for candidate in cfamily_files.siblings_of(path):
+            symbols = symbols_for(candidate)
+            if any(symbol.name == root for symbol in symbols):
+                return CallResolution(
+                    path=candidate,
+                    names=(root,),
+                    confidence=Confidence.INFERRED,
+                    detail=f"'{root}' is defined in the sibling file {candidate}",
+                )
 
     return None
 
@@ -390,7 +490,9 @@ class _ModuleLoader:
             source = absolute.read_bytes()
         except OSError:
             return None
-        return analyze_cached(self._cache, engine, path, source, None)
+        # The walk matches calls against import bindings keyed by module name, so
+        # the loader reports the file under the name its language resolves by.
+        return analyze_cached(self._cache, engine, path, source, CFamilyFiles.module_name_for(path))
 
 
 def _module_name_for(
@@ -407,6 +509,8 @@ def _module_name_for(
         engine = analyzer_for(path, registry)
         if engine is not None and engine.name == "typescript":
             return ts_module_name(path)
+        if cfamily_languages_for(path) is not None:
+            return CFamilyFiles.module_name_for(path)
     names = module_names_for(path, packages)
     return names[-1] if names else None
 
@@ -580,6 +684,8 @@ def _dangling_imports(
     current_paths: tuple[str, ...],
     ts_files: TypeScriptFiles | None = None,
     registry: tuple[Analyzer, ...] | None = None,
+    cfamily_files: CFamilyFiles | None = None,
+    repository: Repository | None = None,
 ) -> list[tuple[str, str, int, str]]:
     """Files left importing a module this session removed.
 
@@ -617,6 +723,16 @@ def _dangling_imports(
             target = resolve_specifier(
                 item.reference.module, item.source_path, ts_pre_index, ts_files.tsconfig
             )
+        elif (
+            cfamily_files is not None
+            and repository is not None
+            and cfamily_languages_for(item.source_path) is not None
+        ):
+            # The same reconstruction in cfamily terms: every pre-session file is
+            # re-indexed so a deleted package's or module's import resolves one
+            # last time — the index in which the target was still there.
+            pre_cfamily = CFamilyFiles.of(pre_paths, repository, include_missing=True)
+            target = pre_cfamily.resolve(item.reference.module, item.source_path)
         else:
             importing = _module_name_for(item.source_path, packages, registry)
             target = resolve_import(
@@ -634,6 +750,7 @@ def _edges_of(
     path: str,
     ts_files: TypeScriptFiles | None = None,
     registry: tuple[Analyzer, ...] | None = None,
+    cfamily_files: CFamilyFiles | None = None,
 ) -> dict[str, tuple[str, int]]:
     """Outgoing dependencies keyed by target file, because that is what a relationship is.
 
@@ -647,10 +764,13 @@ def _edges_of(
         return {}
     engine = analyzer_for(path, registry) if registry else None
     use_ts = ts_files is not None and engine is not None and engine.name == "typescript"
+    use_cfamily = cfamily_files is not None and cfamily_languages_for(path) is not None
     edges: dict[str, tuple[str, int]] = {}
     for reference in analysis.imports:
         if use_ts and ts_files is not None:
             target = resolve_specifier(reference.module, path, ts_files.index, ts_files.tsconfig)
+        elif use_cfamily and cfamily_files is not None:
+            target = cfamily_files.resolve(reference.module, path)
         else:
             target = resolve_import(reference, module_name, index, is_package=is_package_init(path))
         if target is not None:
@@ -669,6 +789,7 @@ def _graph_diff(
     packages: frozenset[str],
     ts_files: TypeScriptFiles | None = None,
     registry: tuple[Analyzer, ...] | None = None,
+    cfamily_files: CFamilyFiles | None = None,
 ) -> GraphDiff:
     """Compare the changed files' dependencies before and after (plan.md §28).
 
@@ -704,8 +825,11 @@ def _graph_diff(
             module.original_path or module.path,
             ts_files,
             registry,
+            cfamily_files,
         )
-        after = _edges_of(module.after, module.module_name, index, module.path, ts_files, registry)
+        after = _edges_of(
+            module.after, module.module_name, index, module.path, ts_files, registry, cfamily_files
+        )
 
         for target, (text, line) in after.items():
             if target not in before:
@@ -901,6 +1025,7 @@ def build_impact_report(
 
     registry = entries or default_registry()
     ts_files: TypeScriptFiles | None = None
+    cfamily_files: CFamilyFiles | None = None
     listing: PythonFiles
 
     if files is not None:
@@ -917,8 +1042,10 @@ def build_impact_report(
         )
         # Built from the *raw* listing: tsconfig.json is not a file any analyzer
         # claims, and alias resolution without it resolves nothing while looking
-        # exactly like a repository that never declared an alias.
+        # exactly like a repository that never declared an alias. The cfamily
+        # indexes read go.mod and package/namespace heads the same way.
         ts_files = TypeScriptFiles.of(supported_paths, repository)
+        cfamily_files = CFamilyFiles.of(supported_paths, repository)
 
     session_analysis = session or analyse_session_modules(
         repository,
@@ -1004,6 +1131,7 @@ def build_impact_report(
                         symbols_for,
                         ts_files,
                         registry,
+                        cfamily_files,
                     )
                     if resolution is None or resolution.path != entry.path:
                         continue
@@ -1093,6 +1221,8 @@ def build_impact_report(
         current_paths,
         ts_files,
         registry,
+        cfamily_files,
+        repository,
     )
     for source, target, line, module_text in dangling:
         evidence = (
@@ -1172,7 +1302,9 @@ def build_impact_report(
         analyzer=session_analysis.analyzer,
         changed_files=tuple(change.path for change in change_set.files),
         nodes=tuple(nodes),
-        graph_diff=_graph_diff(change_set, session_analysis, index, packages, ts_files, registry),
+        graph_diff=_graph_diff(
+            change_set, session_analysis, index, packages, ts_files, registry, cfamily_files
+        ),
         limitations=_limitations(
             len(external),
             session_analysis,

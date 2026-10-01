@@ -21,8 +21,8 @@ from traceflow.config import Config
 from traceflow.derived import AnalysisCache
 from traceflow.git.repository import Repository
 from traceflow.languages.base import ImportRef, ModuleAnalysis, module_analysis_from_json
+from traceflow.languages.cfamily.graph import CFamilyFiles, cfamily_languages_for
 from traceflow.languages.python.analyzer import PythonAnalyzer
-from traceflow.languages.typescript.analyzer import TypeScriptAnalyzer
 from traceflow.languages.typescript.graph import (
     TypeScriptFiles,
     module_name_for,
@@ -49,9 +49,7 @@ def _default_registry() -> tuple[Analyzer, ...]:
     return default_registry()
 
 
-def _analyzer_for(
-    path: str, entries: tuple[Analyzer, ...] | None
-) -> PythonAnalyzer | TypeScriptAnalyzer | None:
+def _analyzer_for(path: str, entries: tuple[Analyzer, ...] | None) -> Analyzer | None:
     """The analyzer that handles *path* — see :func:`_default_registry` for the why."""
     from traceflow.languages.registry import analyzer_for
 
@@ -356,7 +354,7 @@ def list_python_files(repository: Repository) -> tuple[str, ...]:
 
 def analyze_cached(
     cache: AnalysisCache,
-    analyzer: PythonAnalyzer | TypeScriptAnalyzer,
+    analyzer: Analyzer,
     path: str,
     source: bytes,
     module_name: str | None,
@@ -391,6 +389,10 @@ def _module_name_for_path(
     engine = _analyzer_for(path, registry)
     if engine is not None and engine.name == "typescript":
         return module_name_for(path)
+    # The cfamily languages have no package tree to fold: like TypeScript, the
+    # path itself is the module identity a report shows.
+    if cfamily_languages_for(path) is not None:
+        return CFamilyFiles.module_name_for(path)
     names = module_names_for(path, packages)
     # The shortest name is the one rooted at the shallowest non-package directory,
     # which is how the module is actually imported in a src/ layout.
@@ -421,6 +423,7 @@ def build_dependency_graph(
         packages = files.packages
         index = files.index
         ts_files: TypeScriptFiles | None = None
+        cfamily_files: CFamilyFiles | None = None
     else:
         if supported_paths is None:
             supported_paths = list_repository_files(repository)
@@ -430,8 +433,10 @@ def build_dependency_graph(
         paths = tuple(p for p in supported_paths if _analyzer_for(p, registry) is not None)
         # The tsconfig discovery needs the raw listing — a tsconfig.json is not a
         # file any analyzer claims, and an alias table read from nothing resolves
-        # nothing while looking exactly like a repository without aliases.
+        # nothing while looking exactly like a repository without aliases. The
+        # cfamily indexes read go.mod and package/namespace heads the same way.
         ts_files = TypeScriptFiles.of(supported_paths, repository)
+        cfamily_files = CFamilyFiles.of(supported_paths, repository)
 
     modules: list[ModuleNode] = []
     edges: list[ImportEdge] = []
@@ -471,6 +476,8 @@ def build_dependency_graph(
                 target = resolve_specifier(
                     reference.module, path, ts_files.index, ts_files.tsconfig
                 )
+            elif cfamily_files is not None and cfamily_languages_for(path) is not None:
+                target = cfamily_files.resolve(reference.module, path)
             else:
                 target = resolve_import(
                     reference, module_name, index, is_package=is_package_init(path)

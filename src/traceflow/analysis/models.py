@@ -422,8 +422,9 @@ def is_test_path(path: str) -> bool:
 
     Deliberately conservative, in whichever language the file is written. A directory
     literally named ``test``, ``tests`` or ``__tests__`` is a test directory; Python
-    contributes ``test_*.py`` / ``*_test.py`` / ``conftest.py``, and the JavaScript
-    family contributes ``*.test.*``, ``*.spec.*`` and bare ``test.*`` entries. Matching
+    contributes ``test_*.py`` / ``*_test.py`` / ``conftest.py``, the JavaScript
+    family contributes ``*.test.*``, ``*.spec.*`` and bare ``test.*`` entries, and Go
+    contributes its own ``*_test.go`` convention. Matching
     the substring "test" anywhere would classify ``latest/`` as a test directory and
     turn the TESTS section into noise.
     """
@@ -431,6 +432,8 @@ def is_test_path(path: str) -> bool:
     name = normalised.rsplit("/", 1)[-1]
     lowered = name.lower()
     if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if name.endswith("_test.go"):
         return True
     if ".test." in lowered or ".spec." in lowered:
         return True

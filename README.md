@@ -28,7 +28,8 @@ LLM in the analysis engine.
 
 ## Status
 
-**Phases 0–8 complete, and Phase 10 (TypeScript/JavaScript) is in.**
+**Phases 0–8 complete; Phase 10 brought TypeScript/JavaScript and the
+C-family languages (Go, Java, Rust, C#).**
 
 TraceFlow currently:
 
@@ -44,6 +45,10 @@ TraceFlow currently:
   `require`, `import type`, dynamic `import()`, JSX, arrow functions, class members —
   with import resolution across relative paths, directory indexes and tsconfig
   `paths`/`baseUrl` aliases
+- analyses **Go, Java, Rust and C#** through one profile-driven C-family engine:
+  receivers, `impl` blocks, constructors, `async` and generic declarations, with
+  import resolution per language — Go module paths (via `go.mod`), Java packages,
+  Rust `crate::` modules, and C# namespaces
 - builds the repository's import graph on demand, in every supported language
 - walks that graph from the changed symbols to everything they **reach**, separating
   obligations from possibilities and saying where static analysis is blind
@@ -59,7 +64,8 @@ TraceFlow currently:
   what it reaches, with the before/after comparison beside it — and exports it to
   Excalidraw, JSON or SVG
 
-Phase 9 (an optional AI explanation layer) and further languages are post-MVP.
+Phase 9 (an optional AI explanation layer) is post-MVP; a new language is now a
+new profile, not a new pipeline.
 
 ---
 
@@ -575,7 +581,7 @@ There are no runtime dependencies. Phase 1 needs the standard library, `git`, an
 | 7 | Intent vs actual change | **done** |
 | 8 | Test evidence | **done** |
 | 9 | Optional AI explanation layer | planned |
-| 10 | Additional languages: **TypeScript/TSX/JavaScript done** — Go, Java, Rust, C# planned | **TypeScript done** |
+| 10 | Additional languages: **TypeScript/TSX/JavaScript and Go, Java, Rust, C# done** | **six languages done** |
 
 ---
 
@@ -595,7 +601,10 @@ There are no runtime dependencies. Phase 1 needs the standard library, `git`, an
   standard library's `ast`. TypeScript/TSX/JavaScript are analysed with a
   scanner that understands strings, templates, comments and regex literals — a
   deliberate scope, stated in its docstring, rather than a claim to parse the whole
-  language. `plan.md` §6 requires an interface rather than a claim, so
+  language. Go, Java, Rust and C# share one profile-driven scanner: a lexer that
+  masks strings and comments (so a `b'('` never opens a paren), a header classifier
+  driven by per-language keyword tables, and a resolver that knows each language's
+  import idiom. `plan.md` §6 requires an interface rather than a claim, so
   `languages/base.py` defines what an analyzer must provide and each language
   implements it — a new language is a new subpackage plus one registry entry, not a
   rewrite.
